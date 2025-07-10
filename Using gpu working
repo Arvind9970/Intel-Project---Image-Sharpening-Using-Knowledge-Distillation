@@ -1,0 +1,314 @@
+import os
+os.environ["PYTORCH_DIRECTML_DEVICE_ALLOCATOR"] = "default"
+import re
+import glob
+import time
+import torch
+import cv2
+import mss
+import numpy as np
+import onnxruntime as ort
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import vgg16
+import torch_directml
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+
+
+# ---------- Paths ----------
+input_dir = r"C:\Users\Haridath Nihal\Desktop\Data\image_sharpening_project\data\input_images"
+output_dir = r"C:\Users\Haridath Nihal\Desktop\Data\image_sharpening_project\Output Test"
+model_dir = r"C:\Users\Haridath Nihal\Desktop\Data\image_sharpening_project\Student_Model"
+onnx_export_path = "student_model.onnx"
+
+# ---------- Helper ----------
+def center_crop_to_16_9(img):
+    w, h = img.size
+    target_aspect = 16 / 9
+    current_aspect = w / h
+    if current_aspect > target_aspect:
+        new_w = int(h * target_aspect)
+        left = (w - new_w) // 2
+        return img.crop((left, 0, left + new_w, h))
+    else:
+        new_h = int(w / target_aspect)
+        top = (h - new_h) // 2
+        return img.crop((0, top, w, top + new_h))
+
+# ---------- Dataset ----------
+class DIV2KDataset(Dataset):
+    def __init__(self, folder_path, lr_size=(360, 640)):
+        self.image_paths = glob.glob(os.path.join(folder_path, '*.png'))
+        print(f"[Dataset] Found {len(self.image_paths)} images.")
+        self.lr_size = lr_size
+        self.hr_size = (lr_size[0] * 2, lr_size[1] * 2)
+        self.to_tensor = transforms.ToTensor()
+        self.hr_transform = transforms.Resize(self.hr_size)
+        self.lr_transform = transforms.Resize(self.lr_size)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert('RGB')
+        img = center_crop_to_16_9(img)
+        hr = self.hr_transform(img)
+        lr = self.lr_transform(img)
+        return self.to_tensor(lr), self.to_tensor(hr)
+
+# ---------- Model ----------
+class StudentCNN(nn.Module):
+    def __init__(self):
+        super(StudentCNN, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 3, 3, padding=1)
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.upsample(x)
+        x = self.decoder(x)
+        return x
+
+
+# ---------- Perceptual Loss ----------
+def perceptual_loss_fn(output, target, vgg):
+    output_features = vgg(output)
+    target_features = vgg(target)
+    return nn.functional.l1_loss(output_features, target_features)
+
+
+# ---------- Checkpoint ----------
+def get_latest_checkpoint(model_dir):
+    ckpt_files = glob.glob(os.path.join(model_dir, "student_model_epoch[0-9]*.pth"))
+    ckpt_files = [f for f in ckpt_files if not f.endswith("_optim.pth")]
+    if not ckpt_files:
+        return None, 0
+    ckpt_files.sort(key=lambda x: int(re.findall(r"epoch(\d+)", x)[0]))
+    latest_model = ckpt_files[-1]
+    latest_epoch = int(re.findall(r"epoch(\d+)", latest_model)[0])
+    return latest_model, latest_epoch
+
+# ---------- Training ---------
+def train_model(data_dir, model_save_dir, device, additional_epochs=5):
+    dataset = DIV2KDataset(data_dir)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
+
+    model = StudentCNN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    l1_loss = nn.L1Loss()
+
+    vgg = vgg16(weights='IMAGENET1K_V1').features[:9].to(device).eval()
+    for param in vgg.parameters():
+        param.requires_grad = False
+
+    os.makedirs(model_save_dir, exist_ok=True)
+
+    latest_model_path, last_epoch = get_latest_checkpoint(model_save_dir)
+    if latest_model_path:
+        print(f"[Resume] Found checkpoint: {latest_model_path}")
+        model.load_state_dict(torch.load(latest_model_path, map_location=device))
+        optim_path = latest_model_path.replace(".pth", "_optim.pth")
+        if os.path.exists(optim_path):
+            optim_state = torch.load(optim_path, map_location='cpu')
+            optimizer.load_state_dict(optim_state)
+            print(f"[Resume] Optimizer loaded from: {optim_path}")
+        else:
+            print("[Resume] Optimizer state not found.")
+    else:
+        print("[Start] No checkpoint found. Training from scratch.")
+        last_epoch = 0
+
+    total_epochs = last_epoch + additional_epochs
+
+    for epoch in range(last_epoch, total_epochs):
+        model.train()
+        running_loss = 0.0
+        print(f"\n[Training] Epoch {epoch + 1}/{total_epochs}")
+
+        for batch_idx, (lr, hr) in enumerate(dataloader):
+            lr = lr.to(device)
+            hr = hr.to(device)
+
+            output = model(lr)
+            loss = l1_loss(output, hr) + 0.01 * perceptual_loss_fn(output, hr, vgg)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            print(f"[Batch {batch_idx + 1}] Loss: {loss.item():.6f}")
+
+        avg_loss = running_loss / len(dataloader)
+        print(f"[Epoch {epoch + 1}] Avg Loss: {avg_loss:.6f}")
+
+        save_path = os.path.join(model_save_dir, f"student_model_epoch{epoch + 1}.pth")
+        torch.save(model.state_dict(), save_path)
+        torch.save(optimizer.state_dict(), save_path.replace(".pth", "_optim.pth"))
+        print(f"[Checkpoint] Saved to: {save_path}")
+
+    torch.save(model.state_dict(), os.path.join(model_save_dir, "student_model.pth"))
+    print("\n[Training] Done. Final model saved.")
+
+# ---------- Output Viewer ----------
+def show_output_samples(input_dir, model_path, device, output_dir):
+    model = StudentCNN().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    transform = transforms.Compose([
+        transforms.Resize((360, 640)),
+        transforms.ToTensor()
+    ])
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_paths = glob.glob(os.path.join(input_dir, '*.png'))[:4]
+    fig, axs = plt.subplots(4, 2, figsize=(10, 8))
+    fig.suptitle("Input vs Output", fontsize=16)
+
+    with torch.no_grad():
+        for i, img_path in enumerate(image_paths):
+            img = Image.open(img_path).convert('RGB')
+            img = center_crop_to_16_9(img)
+            lr_img = transform(img)
+            input_tensor = lr_img.unsqueeze(0).to(device)
+
+            output = model(input_tensor).clamp(0, 1)
+            out_img = transforms.ToPILImage()(output.squeeze().cpu())
+            out_img.save(os.path.join(output_dir, f"out_{os.path.basename(img_path)}"))
+
+            axs[i, 0].imshow(lr_img.permute(1, 2, 0))
+            axs[i, 0].set_title("Input")
+            axs[i, 0].axis("off")
+
+            axs[i, 1].imshow(out_img)
+            axs[i, 1].set_title("Output")
+            axs[i, 1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+# ---------- ONNX Export ----------
+def export_to_onnx(model_path, export_path, input_size=(360, 640)):
+    device = torch.device("cpu")
+    model = StudentCNN().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    dummy_input = torch.randn(1, 3, input_size[0], input_size[1]).to(device)
+    torch.onnx.export(model, dummy_input, export_path,
+                      input_names=["input"], output_names=["output"], opset_version=11)
+    print(f"[Exported] Model saved to: {export_path}")
+
+# ---------- Live Upscale ----------
+def live_upscale(onnx_path):
+    session = ort.InferenceSession(onnx_path, providers=["DmlExecutionProvider"])
+
+    def preprocess(image_np):
+        # Convert BGR (from OpenCV/mss) to RGB and normalize to float32
+        image_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+        tensor = transforms.ToTensor()(Image.fromarray(image_rgb)).unsqueeze(0)
+        return tensor.numpy().astype(np.float32)  # Ensure float32 dtype
+
+    def postprocess(tensor):
+        # Convert tensor to RGB uint8 image
+        image = (np.clip(tensor.squeeze().transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8)
+
+        # --- Edge Detection ---
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
+        edge_mask = cv2.convertScaleAbs(edges)
+        _, binary_mask = cv2.threshold(edge_mask, 20, 255, cv2.THRESH_BINARY)
+        binary_mask = cv2.GaussianBlur(binary_mask, (5, 5), 0)
+        mask_3ch = cv2.merge([binary_mask] * 3) / 255.0  # Normalize mask
+
+        # --- Sharpening ---
+        sharpen_kernel = np.array([
+            [0, -1.1, 0],
+            [-1.1, 5.5, -1.1],
+            [0, -1.1, 0]
+        ])
+        sharpened = cv2.filter2D(image, -1, sharpen_kernel)
+
+        # Blend sharpened and original based on edge mask
+        result = (sharpened * mask_3ch + image * (1 - mask_3ch)).astype(np.uint8)
+        return result
+
+    monitor = {"top": 200, "left": 500, "width": 640, "height": 360}
+    sct = mss.mss()
+    print("[INFO] Press Q to quit")
+
+    while True:
+        start = time.time()
+
+        frame = np.array(sct.grab(monitor))[:, :, :3]  # BGR
+        input_tensor = preprocess(frame)  # float32 RGB tensor
+
+        output = session.run(None, {"input": input_tensor})[0]
+        upscaled_rgb = postprocess(output)  # RGB uint8
+
+        # Display using OpenCV (expects BGR)
+        upscaled_bgr = cv2.cvtColor(upscaled_rgb, cv2.COLOR_RGB2BGR)
+
+        fps = 1.0 / (time.time() - start)
+        cv2.putText(upscaled_bgr, f"FPS: {fps:.2f}", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+
+        cv2.imshow("Upscaled Output", upscaled_bgr)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cv2.destroyAllWindows()
+
+
+# ---------- Main ----------
+if __name__ == "__main__":
+    device = torch_directml.device()
+    print(f"[Device] Using DirectML on AMD GPU: {device}")
+
+    print("\nChoose mode:")
+    print(" 1. Train More")
+    print(" 2. View Output")
+    print(" 3. Export to ONNX")
+    print(" 4. Live Upscale\n")
+
+    choice = input("Enter 1/2/3/4: ").strip()
+
+    if choice == '1':
+        train_model(input_dir, model_dir, device, additional_epochs=100)
+    elif choice == '2':
+        latest_model_path, _ = get_latest_checkpoint(model_dir)
+        if latest_model_path and os.path.exists(latest_model_path):
+            show_output_samples(input_dir, latest_model_path, device, output_dir)
+        else:
+            print("[Error] No trained model found.")
+    elif choice == '3':
+        model_path = os.path.join(model_dir, "student_model.pth")
+        if os.path.exists(model_path):
+            export_to_onnx(model_path, onnx_export_path)
+        else:
+            print("[Error] student_model.pth not found!")
+    elif choice == '4':
+        if os.path.exists(onnx_export_path):
+            live_upscale(onnx_export_path)
+        else:
+            print("[Error] student_model.onnx not found! Export it first.")
+    else:
+        print("[Error] Invalid input.")
